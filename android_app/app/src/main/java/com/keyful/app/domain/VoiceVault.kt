@@ -1,0 +1,253 @@
+package com.keyful.app.domain
+
+import com.keyful.app.voicelab.VoiceLock
+import org.bouncycastle.crypto.digests.SHAKEDigest
+import org.json.JSONObject
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import java.util.Base64
+import javax.crypto.Cipher
+
+/**
+ * QV6 / QV7 vaults: a few cells of the paper card + your voice (QV6), plus a passphrase (QV7),
+ * and optionally your passport chip. Every factor is key material; the app never decides on
+ * its own that a factor passed.
+ *
+ *   cellSecret, voiceSecret = 32 random bytes each
+ *   vaultKey   = SHAKE256("QV67-KEY" ‖ magic ‖ cellSecret ‖ voiceSecret [‖ passportId])
+ *   cell lock i (CELL_LOCKS of them): a random N-cell subset S_i of the card,
+ *                AES-GCM( Argon2id(values of S_i ‖ i, salt_i, 8 MiB), cellSecret )
+ *   voice lock = VoiceLock(passphrase or none, voiceprint, voiceSecret,
+ *                bind = cellSecret [‖ passportId])
+ *   payload    = the QV5 chunked AES-256-GCM container keyed by vaultKey; both lock sets sit
+ *                in its header line, which every chunk authenticates.
+ *
+ * Unlock: the app picks a random cell lock and asks for its N cells. The right cells give
+ * cellSecret; the voice (+ passphrase) then opens the voice lock; both give vaultKey.
+ * Without the card, N cells are 20·N bits (60 at N = 3) behind Argon2. With the card, QV6
+ * rests on the voice alone (~12 bits per voice lock); QV7's passphrase is what holds then.
+ *
+ * passportId is the digest of the passport chip's Active Authentication public key (DG15),
+ * read over PACE/BAC. It stops anyone who has never read your passport chip, but it is a
+ * public key, not a secret, and the chip's signature check is done by the app, not the math.
+ */
+object VoiceVault {
+    const val QV6 = "QV6"
+    const val QV7 = "QV7"
+    const val MIN_CELLS = 3
+    const val MAX_CELLS = QVaultEngine.K
+    const val CELL_LOCKS = 32
+    /** The voiceprint model is part of the key: another model gives other bits. */
+    const val VOICE_MODEL = "vosk-model-spk-0.4"
+
+    private const val CELL_MEM_KB = 8 * 1024
+    private const val SECRET = 32
+    private const val CELL_CT = SECRET + 16
+    private val CELL_TAG = "QV67-CELLS".toByteArray(StandardCharsets.UTF_8)
+    private val KEY_TAG = "QV67-KEY".toByteArray(StandardCharsets.UTF_8)
+    private val PASSPORT_TAG = "QV67-PCHK".toByteArray(StandardCharsets.UTF_8)
+    private const val PASSPORT_ID = 32
+    private val rng = SecureRandom()
+
+    class CellLock(val xs: IntArray, val salt: ByteArray, val nonce: ByteArray, val ct: ByteArray)
+
+    class Parsed(
+        val magic: String,
+        val cells: Int,
+        val cardFp: String?,
+        val cellLocks: List<CellLock>,
+        val voiceLock: ByteArray,
+        /** Short check of the passport this vault needs; null = no passport. */
+        val passportCheck: String?
+    ) {
+        val withPass: Boolean get() = magic == QV7
+        val withPassport: Boolean get() = passportCheck != null
+    }
+
+    class Opened(val meta: JSONObject, val payload: ByteArray, val keyFp: String)
+
+    fun isVoiceFormat(magic: String?) = magic == QV6 || magic == QV7
+
+    private fun rand(n: Int) = ByteArray(n).also { rng.nextBytes(it) }
+
+    private fun cellAad(i: Int) = CELL_TAG + ByteBuffer.allocate(4).putInt(i).array()
+
+    private fun cellInput(i: Int, xs: IntArray, ys: IntArray): ByteArray {
+        val b = ByteBuffer.allocate(CELL_TAG.size + 4 + 4 * xs.size)
+        b.put(CELL_TAG).putInt(i)
+        for (k in xs.indices) {
+            b.put(xs[k].toByte()).put((ys[k] ushr 16).toByte()).put((ys[k] ushr 8).toByte()).put(ys[k].toByte())
+        }
+        return b.array()
+    }
+
+    private fun vaultKey(magic: String, cellSecret: ByteArray, voiceSecret: ByteArray, passportId: ByteArray?): ByteArray {
+        val input = KEY_TAG + magic.toByteArray(StandardCharsets.UTF_8) + cellSecret + voiceSecret + (passportId ?: ByteArray(0))
+        try {
+            val d = SHAKEDigest(256); d.update(input, 0, input.size)
+            return ByteArray(32).also { d.doFinal(it, 0, 32) }
+        } finally { input.fill(0) }
+    }
+
+    /**
+     * 16-bit check stored in the header so the wrong passport is caught at the tap, before the
+     * voice step. Short on purpose: it is enough to catch mistakes, and weak at linking a vault
+     * to a list of known passports.
+     */
+    fun passportCheck(passportId: ByteArray): String {
+        val d = java.security.MessageDigest.getInstance("SHA-256").digest(PASSPORT_TAG + passportId)
+        return "%02x%02x".format(d[0], d[1])
+    }
+
+    fun passportMatches(p: Parsed, passportId: ByteArray) = p.passportCheck == passportCheck(passportId)
+
+    /** The voice locks' bind secret: the cell secret, plus the passport when the vault needs one. */
+    private fun bindOf(cellSecret: ByteArray, passportId: ByteArray?) =
+        if (passportId == null) cellSecret else cellSecret + passportId
+
+    /** Card coordinates (slip, cell) for a cell index x in 1..140. */
+    fun coordOf(x: Int) = Pair((x - 1) / QVaultEngine.CELLS + 1, (x - 1) % QVaultEngine.CELLS + 1)
+
+    fun seal(
+        payload: ByteArray, metaType: String, metaName: String?, card: VaultCard,
+        magic: String, cells: Int, voice: FloatArray, pass: CharArray, passportId: ByteArray? = null
+    ): ByteArray {
+        require(isVoiceFormat(magic)) { "not a voice format: $magic" }
+        require(passportId == null || passportId.size == PASSPORT_ID) { "passport id must be $PASSPORT_ID bytes" }
+        require(cells in MIN_CELLS..MAX_CELLS) { "cells must be $MIN_CELLS..$MAX_CELLS" }
+        require(magic == QV6 || pass.isNotEmpty()) { "QV7 needs a passphrase" }
+        val cellSecret = rand(SECRET)
+        val voiceSecret = rand(SECRET)
+        try {
+            val all = (1..QVaultEngine.SLIPS * QVaultEngine.CELLS).toList()
+            val locks = ByteArrayOutputStream()
+            val o = DataOutputStream(locks)
+            o.writeInt(CELL_LOCKS)
+            for (i in 0 until CELL_LOCKS) {
+                val xs = all.shuffled(rng).take(cells).toIntArray()
+                val ys = IntArray(cells) { QVaultEngine.evaluate(card.coef, xs[it]) }
+                val salt = rand(16); val nonce = rand(12)
+                val input = cellInput(i, xs, ys)
+                val k = VoiceLock.argon(input, salt, CELL_MEM_KB, 1)
+                input.fill(0); ys.fill(0)
+                val ct = try { VoiceLock.gcm(Cipher.ENCRYPT_MODE, k, nonce, cellAad(i), cellSecret) } finally { k.fill(0) }
+                xs.forEach { o.writeByte(it) }
+                o.write(salt); o.write(nonce); o.write(ct)
+            }
+            o.flush()
+            val bind = bindOf(cellSecret, passportId)
+            val voiceLock = try {
+                VoiceLock.sealBytes(if (magic == QV7) pass else CharArray(0), voice, voiceSecret, bind)
+            } finally { if (bind !== cellSecret) bind.fill(0) }
+            val extra = JSONObject()
+                .put("cells", cells)
+                .put("voice", VOICE_MODEL)
+                .put("clocks", Base64.getEncoder().encodeToString(locks.toByteArray()))
+                .put("vlock", Base64.getEncoder().encodeToString(voiceLock))
+            passportId?.let { extra.put("passport", passportCheck(it)) }
+            val key = vaultKey(magic, cellSecret, voiceSecret, passportId)
+            try {
+                return QVaultEngine.sealPayload(payload, metaType, metaName, key, magic, extra)
+            } finally { key.fill(0) }
+        } finally {
+            cellSecret.fill(0); voiceSecret.fill(0)
+        }
+    }
+
+    /**
+     * Seals, then opens the result once with the same card, voice, passphrase and passport and
+     * compares the payload, so a vault is only handed out after it has been opened.
+     */
+    fun sealVerified(
+        payload: ByteArray, metaType: String, metaName: String?, card: VaultCard,
+        magic: String, cells: Int, voice: FloatArray, pass: CharArray, passportId: ByteArray? = null
+    ): ByteArray {
+        val sealed = seal(payload, metaType, metaName, card, magic, cells, voice, pass, passportId)
+        val p = parse(sealed) ?: error("Self-test failed: the sealed file is not a $magic vault.")
+        val typed = challenge(p, 0).map { card.cells[it] ?: error("Self-test failed: the card has no cell $it.") }
+        val cs = openCells(p, 0, typed) ?: error("Self-test failed: the card's cells did not open the file.")
+        try {
+            val o = open(sealed, p, cs, voice, pass, passportId)
+                ?: error("Self-test failed: the voice lock did not open.")
+            try {
+                check(o.payload.contentEquals(payload)) { "Self-test failed: the opened data did not match." }
+            } finally {
+                o.payload.fill(0)
+            }
+        } finally {
+            cs.fill(0)
+        }
+        return sealed
+    }
+
+    /** null = not a QV6/QV7 file (e.g. QV5). Throws if it claims QV6/QV7 but is damaged. */
+    fun parse(vault: ByteArray): Parsed? {
+        val nl = vault.indexOf('\n'.code.toByte())
+        if (nl <= 0) return null
+        val hdr = try { JSONObject(String(vault, 0, nl, StandardCharsets.UTF_8)) } catch (_: Exception) { return null }
+        val magic = hdr.optString("magic", "")
+        if (!isVoiceFormat(magic)) return null
+        val cells = hdr.optInt("cells", -1)
+        require(cells in MIN_CELLS..MAX_CELLS) { "damaged $magic header: cells=$cells" }
+        val inp = DataInputStream(ByteArrayInputStream(Base64.getDecoder().decode(hdr.getString("clocks"))))
+        val count = inp.readInt()
+        require(count in 1..1024) { "damaged $magic header: $count cell locks" }
+        val max = QVaultEngine.SLIPS * QVaultEngine.CELLS
+        val locks = List(count) {
+            val xs = IntArray(cells) { inp.readUnsignedByte() }
+            require(xs.all { it in 1..max } && xs.distinct().size == cells) { "damaged $magic header: bad cell index" }
+            val salt = ByteArray(16).also { inp.readFully(it) }
+            val nonce = ByteArray(12).also { inp.readFully(it) }
+            val ct = ByteArray(CELL_CT).also { inp.readFully(it) }
+            CellLock(xs, salt, nonce, ct)
+        }
+        val card = if (hdr.has("card")) hdr.getString("card") else null
+        val passport = if (hdr.has("passport")) hdr.getString("passport") else null
+        require(passport == null || Regex("[0-9a-f]{4}").matches(passport)) { "damaged $magic header: passport check" }
+        return Parsed(magic, cells, card, locks, Base64.getDecoder().decode(hdr.getString("vlock")), passport)
+    }
+
+    /** The card coordinates cell lock `lock` asks for, in order. */
+    fun challenge(p: Parsed, lock: Int): List<Pair<Int, Int>> = p.cellLocks[lock].xs.map { coordOf(it) }
+
+    /** cellSecret if these typed cells are right for `lock`, else null. */
+    fun openCells(p: Parsed, lock: Int, typed: List<String>): ByteArray? {
+        val cl = p.cellLocks[lock]
+        if (typed.size != cl.xs.size) return null
+        val ys = IntArray(typed.size) { QVaultEngine.decCell(QVaultEngine.clean(typed[it])) }
+        val input = cellInput(lock, cl.xs, ys)
+        val k = VoiceLock.argon(input, cl.salt, CELL_MEM_KB, 1)
+        input.fill(0); ys.fill(0)
+        return try {
+            VoiceLock.gcm(Cipher.DECRYPT_MODE, k, cl.nonce, cellAad(lock), cl.ct)
+        } catch (_: Exception) {
+            null
+        } finally { k.fill(0) }
+    }
+
+    /**
+     * Opens the vault once the cells gave cellSecret (and the passport its id, if the vault
+     * needs one). null = the voice lock stayed shut: voice, passphrase or passport did not
+     * fit. Throws if the payload itself is damaged.
+     */
+    fun open(
+        vault: ByteArray, p: Parsed, cellSecret: ByteArray, voice: FloatArray, pass: CharArray,
+        passportId: ByteArray? = null
+    ): Opened? {
+        val pid = if (p.withPassport) passportId ?: return null else null
+        val bind = bindOf(cellSecret, pid)
+        val o = try {
+            VoiceLock.openBytes(if (p.withPass) pass else CharArray(0), voice, p.voiceLock, bind)
+        } finally { if (bind !== cellSecret) bind.fill(0) } ?: return null
+        val key = try { vaultKey(p.magic, cellSecret, o.secret, pid) } finally { o.secret.fill(0) }
+        try {
+            val (meta, payload) = QVaultEngine.openPayload(vault, key)
+            return Opened(meta, payload, QVaultEngine.keyFp(key))
+        } finally { key.fill(0) }
+    }
+}
